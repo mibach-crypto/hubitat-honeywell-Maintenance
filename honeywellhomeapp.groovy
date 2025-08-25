@@ -166,6 +166,17 @@ def LogError(logMessage)
     log.error "${logMessage}";
 }
 
+def maskCredential(value)
+{
+    if(!value)
+    {
+        return "null"
+    }
+    def len = value.length()
+    def lastFour = len > 4 ? value.substring(len - 4) : value
+    return "****${lastFour}"
+}
+
 def installed()
 {
     LogInfo("Installing Honeywell Home.");
@@ -192,9 +203,9 @@ def initialize()
     }
 }
 
-def updated() 
+def updated()
 {
-    LogDebug("Updated with config: ${settings}");
+    LogDebug("Updated with config; consumerKey: ${maskCredential(settings.consumerKey)}, consumerSecret: ${maskCredential(settings.consumerSecret)}");
     if (refreshIntervals == null)
     {
         refreshIntervals = 10;
@@ -212,10 +223,10 @@ def uninstalled()
     }
 }
 
-def connectToHoneywell() 
+def connectToHoneywell()
 {
     LogDebug("connectToHoneywell()");
-    LogDebug("Key: ${settings.consumerKey}")
+    LogDebug("Key: ${maskCredential(settings.consumerKey)}")
 
     //if this isn't defined early then the redirect fails for some reason...
     def redirectLocation = "http://www.bing.com";
@@ -232,7 +243,7 @@ def connectToHoneywell()
         path: "/oauth2/authorize",
         queryString: authQueryString.toString()
     ]
-    LogDebug("honeywell_auth request params: ${params}");
+    LogDebug("honeywell_auth request query: ${authQueryString.replace(settings.consumerKey, maskCredential(settings.consumerKey))}");
     try {
         httpPost(params) { response -> 
             if (response.status == 302) 
@@ -372,7 +383,12 @@ def discoverDevices()
     def headers = [ Authorization: 'Bearer ' + state.access_token ]
     def contentType = 'application/json'
     def params = [ uri: uri, headers: headers, contentType: contentType ]
-    LogDebug("Location Discovery-params ${params}")
+    def safeParams = [
+            uri: uri.replace(settings.consumerKey, maskCredential(settings.consumerKey)),
+            headers: [Authorization: 'Bearer ****'],
+            contentType: contentType
+    ]
+    LogDebug("Location Discovery-params ${safeParams}")
 
     //add error checking
     def reJson =''
@@ -502,8 +518,7 @@ def handleAuthRedirect()
     LogDebug("handleAuthRedirect()");
 
     def authCode = params.code
-
-    LogDebug("AuthCode: ${authCode}")
+    LogDebug("AuthCode: ${maskCredential(authCode)}")
     def authorization = ("${settings.consumerKey}:${settings.consumerSecret}").bytes.encodeBase64().toString()
 
     def headers = [
@@ -577,7 +592,6 @@ def loginResponse(response)
     def reCode = response.getStatus();
     def reJson = response.getData();
     LogDebug("reCode: {$reCode}")
-    LogDebug("reJson: {$reJson}")
 
     if (reCode == 200)
     {
@@ -678,7 +692,13 @@ def refreshThermosat(com.hubitat.app.DeviceWrapper device, retry=false)
     def headers = [ Authorization: 'Bearer ' + state.access_token ]
     def contentType = 'application/json'
     def params = [ uri: uri, headers: headers, contentType: contentType ]
-    LogDebug("Location Discovery-params ${params}")
+    def safeHeaders = headers.collectEntries { k, v -> k == 'Authorization' ? [k: 'Bearer ****'] : [k: v] }
+    def safeParams = [
+            uri: uri.replace(settings.consumerKey, maskCredential(settings.consumerKey)),
+            headers: safeHeaders,
+            contentType: contentType
+    ]
+    LogDebug("Location Discovery-params ${safeParams}")
 
     //add error checking
     def reJson =''
@@ -804,7 +824,13 @@ String getRemoteSensorUserDefName(String parentDeviceId, String locationId, Stri
     def headers = [ Authorization: 'Bearer ' + state.access_token ]
     def contentType = 'application/json'
     def params = [ uri: uri, headers: headers, contentType: contentType ]
-    LogDebug("getRemoteSensorUserDefName - params ${params}")
+    def safeHeaders = headers.collectEntries { k, v -> k == 'Authorization' ? [k: 'Bearer ****'] : [k: v] }
+    def safeParams = [
+            uri: uri.replace(settings.consumerKey, maskCredential(settings.consumerKey)),
+            headers: safeHeaders,
+            contentType: contentType
+    ]
+    LogDebug("getRemoteSensorUserDefName - params ${safeParams}")
 
     def reJson =''
     try
@@ -886,7 +912,13 @@ def refreshRemoteSensor(com.hubitat.app.DeviceWrapper device, retry=false)
     def headers = [ Authorization: 'Bearer ' + state.access_token ]
     def contentType = 'application/json'
     def params = [ uri: uri, headers: headers, contentType: contentType ]
-    LogDebug("refreshRemoteSensor - params ${params}")
+    def safeHeaders = headers.collectEntries { k, v -> k == 'Authorization' ? [k: 'Bearer ****'] : [k: v] }
+    def safeParams = [
+            uri: uri.replace(settings.consumerKey, maskCredential(settings.consumerKey)),
+            headers: safeHeaders,
+            contentType: contentType
+    ]
+    LogDebug("refreshRemoteSensor - params ${safeParams}")
 
     //add error checking
     def reJson =''
@@ -1036,7 +1068,13 @@ def setThermosatSetPoint(com.hubitat.app.DeviceWrapper device, mode=null, autoCh
     }
 
     def params = [ uri: uri, headers: headers, body: body]
-    LogDebug("setThermosat-params ${params}")
+    def safeHeaders = headers.collectEntries { k, v -> k == 'Authorization' ? [k: 'Bearer ****'] : [k: v] }
+    def safeParams = [
+            uri: uri.replace(settings.consumerKey, maskCredential(settings.consumerKey)),
+            headers: safeHeaders,
+            body: body
+    ]
+    LogDebug("setThermosat-params ${safeParams}")
 
     try
     {
@@ -1104,7 +1142,13 @@ def setThermosatFan(com.hubitat.app.DeviceWrapper device, fan=null, retry=false)
             mode:fan]
 
     def params = [ uri: uri, headers: headers, body: body]
-    LogDebug("setThermosat-params ${params}")
+    def safeHeaders = headers.collectEntries { k, v -> k == 'Authorization' ? [k: 'Bearer ****'] : [k: v] }
+    def safeParams = [
+            uri: uri.replace(settings.consumerKey, maskCredential(settings.consumerKey)),
+            headers: safeHeaders,
+            body: body
+    ]
+    LogDebug("setThermosat-params ${safeParams}")
 
     try
     {
