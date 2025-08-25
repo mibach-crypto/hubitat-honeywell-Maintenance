@@ -13,7 +13,7 @@ I would consider this beta code, there are definitely rough edges that still nee
 ### Not Yet Implemented/Tested
 - Events (honeywell supports Azure Event Grid, that needs to be implemented and might require per user accounts)
 - Schedules via Honeywelll (I am using the Hubitat Thermostat Scheduler personally)
-- Celsius (I put some code in for this but didn't test it)
+- Celsius support implemented but may require further testing
 - Name changes (if you change the name of the device)
 - Tokens seems to require forced refresh from time to time (there is a scheduled refresh and a force option in the debug menu).
 
