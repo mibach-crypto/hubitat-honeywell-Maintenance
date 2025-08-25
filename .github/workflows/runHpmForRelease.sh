@@ -40,7 +40,7 @@ releaseJson=$(curl -H "Accept: application/vnd.github.v3+json" https://api.githu
 echo $releaseJson
 
 releaseNote=$(jq .body <<<$releaseJson)
-echo $releaseNote
+echo "$releaseNote"
 
 if [[ -z "${releaseNote}" ]]; then
   echo "Release Notes Could Not Be Found - did the release have body text?"; exit 1 ;
@@ -71,7 +71,7 @@ echo "Running: $hpmCmd"
 eval $hpmCmd
 [ $? -eq 0 ]  || exit 1
 
-hpmCmd="./.github/workflows/tools/hpm manifest-modify ../hubitat-packages/packages/honeywellManifest.json --version=$version --releasenotes=$releaseNote"
+hpmCmd="./.github/workflows/tools/hpm manifest-modify ../hubitat-packages/packages/honeywellManifest.json --version=$version --releasenotes=\"$releaseNote\""
 echo "Running: $hpmCmd"
 eval $hpmCmd
 [ $? -eq 0 ]  || exit 1
