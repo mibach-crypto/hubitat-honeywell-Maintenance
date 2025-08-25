@@ -850,7 +850,7 @@ String getRemoteSensorUserDefName(String parentDeviceId, String locationId, Stri
         {
             LogWarn('Authorization token expired, will refresh and retry.')
             refreshToken()
-            getRemoteSensorUserDefName(parentDeviceId, locationId, groupId, roomID, true)
+            getRemoteSensorUserDefName(parentDeviceId, locationId, groupId, roomId, true)
         }
 
         LogError("Remote Sensor API failed -- ${e.getLocalizedMessage()}: ${e.response.data}")
@@ -907,7 +907,7 @@ def refreshRemoteSensor(com.hubitat.app.DeviceWrapper device, retry=false)
     LogDebug("refreshRemoteSensor()")
     def honeywellDeviceID = device.currentValue("parentDeviceId")
     def honeywellLocation = device.currentValue("locationId")
-    def roomID = device.currentValue("roomId")
+    def roomId = device.currentValue("roomId")
     def uri = global_apiURL + '/v2/devices/thermostats/'+ honeywellDeviceID + '/priority?apikey=' + settings.consumerKey + '&locationId=' + honeywellLocation
     def headers = [ Authorization: 'Bearer ' + state.access_token ]
     def contentType = 'application/json'
@@ -961,7 +961,7 @@ def refreshRemoteSensor(com.hubitat.app.DeviceWrapper device, retry=false)
 
     def roomJson
     reJson.currentPriority.rooms.each{ room ->
-        if (room.id == roomID) {
+        if (room.id == roomId) {
             roomJson = room
             return
         }
