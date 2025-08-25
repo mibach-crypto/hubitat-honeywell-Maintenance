@@ -22,7 +22,7 @@ jobs:
     # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
       # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
       - name: Init_Log
         run: echo CREATEPACKAGEONRELEASE Started!
@@ -34,7 +34,7 @@ jobs:
 
       # Pulls the secrete to access the package repo and checks it out
       - name: Checkout secrets
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
  
       - name: Decrypt secrets
         env:
