@@ -591,7 +591,8 @@ def loginResponse(response)
 
     def reCode = response.getStatus();
     def reJson = response.getData();
-    LogDebug("reCode: {$reCode}")
+    LogDebug("reCode: ${reCode}")
+    LogDebug("reJson: ${reJson}")
 
     if (reCode == 200)
     {
@@ -804,8 +805,8 @@ def refreshThermosat(com.hubitat.app.DeviceWrapper device, retry=false)
             response ->
             def reCode = response.getStatus();
             reJson = response.getData();
-            LogDebug("reCode: {$reCode}")
-            LogDebug("reJson: {$reJson}")
+            LogDebug("reCode: ${reCode}")
+            LogDebug("reJson: ${reJson}")
         }
     }
     catch (groovyx.net.http.HttpResponseException e) 
@@ -938,8 +939,8 @@ String getRemoteSensorUserDefName(String parentDeviceId, String locationId, Stri
                     response ->
                         def reCode = response.getStatus();
                         reJson = response.getData();
-                        LogDebug("reCode: {$reCode}")
-                        LogDebug("reJson: {$reJson}")
+                        LogDebug("reCode: ${reCode}")
+                        LogDebug("reJson: ${reJson}")
                 }
     }
     catch (groovyx.net.http.HttpResponseException e)
@@ -1027,8 +1028,8 @@ def refreshRemoteSensor(com.hubitat.app.DeviceWrapper device, retry=false)
                     response ->
                         def reCode = response.getStatus();
                         reJson = response.getData();
-                        LogDebug("reCode: {$reCode}")
-                        LogDebug("reJson: {$reJson}")
+                        LogDebug("reCode: ${reCode}")
+                        LogDebug("reJson: ${reJson}")
                 }
     }
     catch (groovyx.net.http.HttpResponseException e)
