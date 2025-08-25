@@ -599,19 +599,114 @@ def RefreshAllDevices()
     LogDebug("RefreshAllDevices()");
 
     def children = getChildDevices()
-    children.each 
+    if (children == null)
     {
-        if (it != null) 
+        LogWarn("RefreshAllDevices called with no children")
+        return
+    }
+
+    // Group devices by location so we can issue a single request per location
+    def devicesByLocation = [:].withDefault{[]}
+    children.each { child ->
+        if (child != null)
         {
-            // Thermostat or Sensor?
-            if (it.hasAttribute("groupId") && it.hasAttribute("roomId")) {
-                refreshRemoteSensor(it)
+            def devId = child.getDeviceNetworkId()
+            def locId
+            if (child.hasAttribute("groupId") && child.hasAttribute("roomId"))
+            {
+                // Remote sensor network id uses dashes without spaces
+                locId = devId.tokenize('-')[0]
             }
-            else {
-                refreshThermosat(it)
+            else
+            {
+                def locDel = devId.indexOf('-')
+                locId = devId.substring(0, (locDel-1))
+            }
+            devicesByLocation[locId] << child
+        }
+    }
+
+    devicesByLocation.each { loc, devs ->
+        if (!refreshLocationBatch(loc, devs))
+        {
+            LogInfo("Batch refresh unavailable, throttling devices for location ${loc}")
+            def delayMs = state.rateLimitMs ?: 1000
+            devs.eachWithIndex { d, idx ->
+                if (idx > 0)
+                {
+                    LogDebug("Throttling API call by ${delayMs} ms for ${d.displayName}")
+                    pauseExecution(delayMs)
+                }
+
+                if (d.hasAttribute("groupId") && d.hasAttribute("roomId"))
+                {
+                    refreshRemoteSensor(d)
+                }
+                else
+                {
+                    refreshThermosat(d)
+                }
             }
         }
     }
+}
+
+def refreshLocationBatch(String locationId, List devices)
+{
+    LogInfo("Attempting batch refresh for location ${locationId}")
+
+    def uri = global_apiURL + '/v2/devices/thermostats?apikey=' + settings.consumerKey + '&locationId=' + locationId
+    def headers = [ Authorization: 'Bearer ' + state.access_token ]
+    def contentType = 'application/json'
+    def params = [ uri: uri, headers: headers, contentType: contentType ]
+    LogDebug("Batch Refresh-params ${params}")
+
+    def reJson = null
+    try
+    {
+        httpGet(params)
+        {
+            response ->
+                reJson = response.getData()
+        }
+    }
+    catch (Exception e)
+    {
+        LogWarn("Batch refresh failed for location ${locationId} -- ${e.message}")
+        return false
+    }
+
+    if (reJson == null)
+    {
+        return false
+    }
+
+    LogInfo("Batch refresh for location ${locationId} returned ${reJson.size()} thermostats")
+
+    reJson.each { thermo ->
+        def netId = "${locationId} - ${thermo.deviceID}"
+        def device = devices.find { it.getDeviceNetworkId() == netId }
+        if (device)
+        {
+            processThermostatData(thermo, device)
+
+            // Update any remote sensors contained in the batch response
+            if (thermo?.remoteSensors)
+            {
+                thermo.remoteSensors.each { sensor ->
+                    def sensorNetId = "${locationId}-${thermo.deviceID}-${sensor.groupId}-${sensor.roomId}"
+                    def childSensor = devices.find { it.getDeviceNetworkId() == sensorNetId }
+                    if (childSensor)
+                    {
+                        def units = device.currentValue("units") ?: "°F"
+                        processRemoteSensorRoom(sensor, childSensor, units)
+                    }
+                }
+            }
+        }
+    }
+    LogInfo("Batch refresh complete for location ${locationId}")
+    return true
 }
 
 def refreshHelper(jsonString, cloudString, deviceString, com.hubitat.app.DeviceWrapper device, optionalUnits=null, optionalMakeLowerMap=false, optionalMakeLowerString=false, optionalIsStateChange=false)
@@ -714,6 +809,11 @@ def refreshThermosat(com.hubitat.app.DeviceWrapper device, retry=false)
         return;
     }
 
+    processThermostatData(reJson, device)
+}
+
+def processThermostatData(reJson, com.hubitat.app.DeviceWrapper device)
+{
     def tempUnits = "°F"
     if (reJson.units != "Fahrenheit")
     {
@@ -721,8 +821,7 @@ def refreshThermosat(com.hubitat.app.DeviceWrapper device, retry=false)
     }
     sendEvent(device, [name: "units", value: tempUnits])
     LogDebug("updateThermostats-tempUnits: ${tempUnits}")
-    
-    
+
     def now = new Date().format('MM/dd/yyyy h:mm a', location.timeZone)
     sendEvent(device, [name: "lastUpdate", value: now, descriptionText: "Last Update: $now", isStateChange: true])
 
@@ -738,7 +837,7 @@ def refreshThermosat(com.hubitat.app.DeviceWrapper device, retry=false)
     {
         LogDebug("reJson = ${reJson}")
     }
-    
+
     if (reJson.changeableValues.containsKey("autoChangeoverActive"))
     {
         refreshHelper(reJson.changeableValues, "autoChangeoverActive", "autoChangeoverActive", device, null, false, false)
@@ -786,8 +885,7 @@ def refreshThermosat(com.hubitat.app.DeviceWrapper device, retry=false)
     else if(operationStatus == "EmergencyHeat")
     {
         formatedOperationStatus = "emergencyHeating";
-    } 
-    
+    }
     else
     {
         LogError("Unexpected Operation Status: ${operationStatus}")
@@ -938,7 +1036,12 @@ def refreshRemoteSensor(com.hubitat.app.DeviceWrapper device, retry=false)
         LogError("RefreshRemoteSensor() roomJson = null")
         return
     }
-    LogDebug( "roomJson: ${roomJson}")
+    processRemoteSensorRoom(roomJson, device, tempUnits)
+}
+
+def processRemoteSensorRoom(roomJson, com.hubitat.app.DeviceWrapper device, tempUnits)
+{
+    LogDebug("roomJson: ${roomJson}")
     //TO DO: Fix accessory indexing workaround (if possible)
     refreshSensorTemperature(roomJson.accessories[0], "temperature", "temperature", device, tempUnits)
     refreshHelper(roomJson, "roomAvgHumidity", "humidity", device, null, false, false)
