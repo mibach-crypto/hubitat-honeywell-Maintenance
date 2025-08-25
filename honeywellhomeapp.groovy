@@ -1071,7 +1071,7 @@ def setThermosatFan(com.hubitat.app.DeviceWrapper device, fan=null, retry=false)
 
     if (fan == null)
     {
-        fan=device.('thermostatFanMode');
+        fan = device.currentValue('thermostatFanMode')
     }
 
     if (fan.toLowerCase() == "auto")
