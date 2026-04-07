@@ -176,12 +176,21 @@ def uninstalled() {
 
 def initialize() {
     unschedule()
+    unsubscribe()
     if (!atomicState.accounts) { atomicState.accounts = [:] }
-    
+
+    // RECOVERY: If accounts map is empty but we have stored credentials, rebuild it.
+    // This handles the case where atomicState gets corrupted or wiped (e.g., after hub reboot/restore).
+    if (atomicState.accounts.size() == 0) {
+        log("Accounts map is empty. Attempting to recover from saved settings...", "warn")
+        recoverAccounts()
+    }
+
     // Schedule periodic refresh
-    if (refreshInterval.toInteger() > 0) {
-        log("Scheduling refresh every ${refreshInterval} minutes.", "info")
-        schedule("0 0/${refreshInterval} * * * ?", refreshAllDevices)
+    def interval = refreshInterval ? refreshInterval.toInteger() : 10
+    if (interval > 0) {
+        log("Scheduling refresh every ${interval} minutes.", "info")
+        schedule("0 0/${interval} * * * ?", refreshAllDevices)
     }
 
     // Schedule Smart Control logic
@@ -191,14 +200,73 @@ def initialize() {
         if (motionSensors) {
             subscribe(motionSensors, "motion", smartControlHandler)
         }
-        runIn(5, updateSmartSetpoint) // Initial run
+        runIn(5, "updateSmartSetpoint") // Initial run
     }
-    
-    // Refresh tokens
+
+    // Refresh tokens for Resideo accounts
     atomicState.accounts.each { accountId, account ->
         if (account.type == "Resideo") {
             scheduleResideoTokenRefresh(accountId)
         }
+    }
+
+    // Do an initial refresh shortly after initialization
+    runIn(10, "refreshAllDevices")
+
+    log("Initialize complete. Accounts: ${atomicState.accounts.size()}, Child devices: ${getChildDevices().size()}", "info")
+}
+
+void recoverAccounts() {
+    // Recover Resideo account from stored OAuth credentials
+    if (resideoConsumerKey && resideoConsumerSecret) {
+        def accountId = "resideo_${resideoConsumerKey.take(8)}"
+        def existingTokens = [:]
+        // Check if we have tokens in the top-level atomicState (legacy storage)
+        if (atomicState.access_token) {
+            existingTokens.access_token = atomicState.access_token
+        }
+        if (atomicState.refresh_token) {
+            existingTokens.refresh_token = atomicState.refresh_token
+        }
+
+        def account = [
+            type: "Resideo",
+            consumerKey: resideoConsumerKey,
+            consumerSecret: resideoConsumerSecret
+        ]
+        if (existingTokens.access_token) {
+            account.access_token = existingTokens.access_token
+            log("Recovered Resideo access token from legacy state.", "info")
+        }
+        if (existingTokens.refresh_token) {
+            account.refresh_token = existingTokens.refresh_token
+            account.expires_in = 1800 // Default to 30 min, will be corrected on next refresh
+            log("Recovered Resideo refresh token from legacy state.", "info")
+        }
+
+        def accounts = atomicState.accounts ?: [:]
+        accounts[accountId] = account
+        atomicState.accounts = accounts
+        log("Recovered Resideo account: ${accountId}", "info")
+
+        // If we recovered a refresh token, immediately try to get a fresh access token
+        if (account.refresh_token) {
+            runIn(2, "refreshResideoTokenById", [data: [accountId: accountId]])
+        }
+    }
+
+    // Recover TCC account from stored credentials
+    if (tccUsername && tccPassword) {
+        def accountId = "tcc_${tccUsername}"
+        def accounts = atomicState.accounts ?: [:]
+        accounts[accountId] = [
+            type: "TCC",
+            username: tccUsername,
+            password: tccPassword
+        ]
+        atomicState.accounts = accounts
+        log("Recovered TCC account: ${accountId}. Will re-login to get fresh cookie.", "info")
+        runIn(5, "loginToTcc")
     }
 }
 
@@ -246,7 +314,8 @@ def connectToResideo() {
 
 void oauthCallback(response) {
     def accountId = params.accountId
-    def account = atomicState.accounts[accountId]
+    def accounts = atomicState.accounts ?: [:]
+    def account = accounts[accountId]
     if (!account) {
         log("OAuth callback received for unknown account ID: ${accountId}", "error")
         return
@@ -256,20 +325,28 @@ void oauthCallback(response) {
     def authCode = params.code
     def authorization = ("${account.consumerKey}:${account.consumerSecret}").bytes.encodeBase64().toString()
 
-    def params = [
+    // FIXED: Renamed to avoid shadowing the 'params' request parameters
+    def tokenParams = [
         uri: "${RESIDEO_API_URL}/oauth2/token",
         headers: [ Authorization: "Basic ${authorization}", Accept: "application/json" ],
         body: [ grant_type: "authorization_code", code: authCode, redirect_uri: OAUTH_REDIRECT_URL ]
     ]
 
     try {
-        httpPost(params) { resp ->
+        httpPost(tokenParams) { resp ->
             if (resp.status == 200) {
                 log("Successfully obtained Resideo tokens.", "info")
-                account.access_token = resp.data.access_token
-                account.refresh_token = resp.data.refresh_token
-                account.expires_in = resp.data.expires_in
-                atomicState.accounts[accountId] = account // Save updated account info
+                // FIXED: Must re-read, modify copy, write back for atomicState
+                def accts = atomicState.accounts ?: [:]
+                def acct = accts[accountId] ?: [:]
+                acct.access_token = resp.data.access_token
+                acct.refresh_token = resp.data.refresh_token
+                acct.expires_in = resp.data.expires_in
+                accts[accountId] = acct
+                atomicState.accounts = accts
+                // Also store tokens at top level as backup
+                atomicState.access_token = resp.data.access_token
+                atomicState.refresh_token = resp.data.refresh_token
                 scheduleResideoTokenRefresh(accountId)
             } else {
                 log("Failed to get Resideo tokens. Status: ${resp.status}, Data: ${resp.data}", "error")
@@ -281,44 +358,69 @@ void oauthCallback(response) {
 }
 
 def scheduleResideoTokenRefresh(accountId) {
-    def account = atomicState.accounts[accountId]
+    def accounts = atomicState.accounts
+    def account = accounts ? accounts[accountId] : null
     if (account?.expires_in) {
-        def refreshTime = account.expires_in.toInteger() - 300 // Refresh 5 minutes before expiry
+        def refreshTime = Math.max(account.expires_in.toInteger() - 300, 60) // Refresh 5 minutes before expiry, min 60s
         log("Scheduling Resideo token refresh for account ${accountId} in ${refreshTime} seconds.", "info")
-        runIn(refreshTime, "refreshResideoToken", [data: [accountId: accountId]])
+        runIn(refreshTime, "refreshResideoTokenById", [data: [accountId: accountId]])
+    } else {
+        // If no expires_in, schedule a refresh in 5 minutes as a safety net
+        log("No expires_in found for account ${accountId}. Scheduling token refresh in 300 seconds as safety net.", "warn")
+        runIn(300, "refreshResideoTokenById", [data: [accountId: accountId]])
     }
 }
 
+// Called by runIn which passes a Map: [accountId: "xxx"]
+void refreshResideoTokenById(Map data) {
+    def acctId = data?.accountId
+    if (!acctId) {
+        log("refreshResideoTokenById called without accountId in data map.", "error")
+        return
+    }
+    refreshResideoToken(acctId)
+}
+
 void refreshResideoToken(String accountId) {
-    def account = atomicState.accounts[accountId]
+    def accounts = atomicState.accounts
+    def account = accounts ? accounts[accountId] : null
     if (!account || !account.refresh_token) {
-        log("Cannot refresh Resideo token, no refresh token found for account ${accountId}.", "warn")
+        log("Cannot refresh Resideo token, no refresh token found for account ${accountId}. Accounts present: ${accounts?.keySet()}", "warn")
         return
     }
 
     log("Refreshing Resideo access token for account ${accountId}.", "info")
     def authorization = ("${account.consumerKey}:${account.consumerSecret}").bytes.encodeBase64().toString()
-    def params = [
+    def tokenParams = [
         uri: "${RESIDEO_API_URL}/oauth2/token",
         headers: [ Authorization: "Basic ${authorization}", Accept: "application/json" ],
         body: [ grant_type: "refresh_token", refresh_token: account.refresh_token ]
     ]
-    
+
     try {
-        httpPost(params) { resp ->
+        httpPost(tokenParams) { resp ->
             if (resp.status == 200) {
                 log("Successfully refreshed Resideo tokens.", "info")
-                account.access_token = resp.data.access_token
-                account.refresh_token = resp.data.refresh_token
-                account.expires_in = resp.data.expires_in
-                atomicState.accounts[accountId] = account
+                // Must re-read atomicState, modify the copy, and write it back
+                def accts = atomicState.accounts ?: [:]
+                def acct = accts[accountId] ?: [:]
+                acct.access_token = resp.data.access_token
+                acct.refresh_token = resp.data.refresh_token
+                acct.expires_in = resp.data.expires_in
+                accts[accountId] = acct
+                atomicState.accounts = accts
+                // Also store tokens at top level as backup for recovery
+                atomicState.access_token = resp.data.access_token
+                atomicState.refresh_token = resp.data.refresh_token
                 scheduleResideoTokenRefresh(accountId)
             } else {
                 log("Failed to refresh Resideo token. Status: ${resp.status}, Data: ${resp.data}", "error")
             }
         }
     } catch (e) {
-        log("Error refreshing Resideo token: ${e.message}", "error")
+        log("Error refreshing Resideo token: ${e.message}. Will retry in 60 seconds.", "error")
+        // Schedule a retry instead of silently failing forever
+        runIn(60, "refreshResideoTokenById", [data: [accountId: accountId]])
     }
 }
 
@@ -469,10 +571,28 @@ def listDiscoveredDevices() {
 // Device Refresh
 // --------------------
 void refreshAllDevices() {
-    log("Refreshing all devices...", "debug")
+    log("Refreshing all devices... (${getChildDevices().size()} children, ${atomicState.accounts?.size() ?: 0} accounts)", "info")
+    if (!atomicState.accounts || atomicState.accounts.size() == 0) {
+        log("WARNING: No accounts configured. Attempting recovery before refresh.", "warn")
+        recoverAccounts()
+    }
     getChildDevices().each { dev ->
         pauseExecution(1000) // Basic throttling to prevent hammering APIs
+        try {
+            refreshDevice(dev)
+        } catch (e) {
+            log("Exception refreshing device ${dev.label}: ${e.message}", "error")
+        }
+    }
+}
+
+// Entry point when called via runIn with data map
+void refreshDeviceByDni(Map data) {
+    def dev = getChildDevice(data?.dni)
+    if (dev) {
         refreshDevice(dev)
+    } else {
+        log("refreshDeviceByDni: Could not find device with DNI: ${data?.dni}", "error")
     }
 }
 
@@ -482,74 +602,124 @@ void refreshDevice(device) {
         refreshResideoThermostat(device)
     } else if (apiSource == "TCC") {
         refreshTccThermostat(device)
+    } else {
+        // Check if this is a remote sensor child
+        def parentDni = device.getDataValue("parentDeviceNetId")
+        if (parentDni) {
+            log("Device ${device.label} is a remote sensor, will be refreshed with parent.", "debug")
+        } else {
+            log("Unknown API source for device ${device.label}: ${apiSource}", "warn")
+        }
+    }
+}
+
+// Entry point when called via runIn with data map
+void refreshResideoThermostatByDni(Map data) {
+    def dev = getChildDevice(data?.dni)
+    if (dev) {
+        refreshResideoThermostat(dev, data?.retry ?: false)
+    } else {
+        log("refreshResideoThermostatByDni: Could not find device with DNI: ${data?.dni}", "error")
     }
 }
 
 def refreshResideoThermostat(device, retry = false) {
     def dniParts = device.deviceNetworkId.split('\\|')
+    if (dniParts.size() < 3) {
+        log("Invalid DNI format for Resideo device: ${device.deviceNetworkId}", "error")
+        return
+    }
     def locationId = dniParts[1]
     def deviceId = dniParts[2]
-    def account = atomicState.accounts[device.getDataValue("accountId")]
+    def accounts = atomicState.accounts
+    def account = accounts ? accounts[device.getDataValue("accountId")] : null
+
+    if (!account || !account.access_token) {
+        log("No valid account/token found for Resideo device ${device.label}. AccountId: ${device.getDataValue('accountId')}", "error")
+        return
+    }
 
     log("Refreshing Resideo device: ${device.label}", "debug")
-    
-    def params = [
+
+    def getParams = [
         uri: "${RESIDEO_API_URL}/v2/devices/thermostats/${deviceId}?apikey=${account.consumerKey}&locationId=${locationId}",
         headers: [ Authorization: "Bearer ${account.access_token}" ]
     ]
-    
-    apiGet(params, { resp ->
+
+    apiGet(getParams, { resp ->
         // Parse Resideo data and send events to driver
-        def data = resp.data
+        def respData = resp.data
         device.parse([
-            temperature: data.indoorTemperature,
-            humidity: data.indoorHumidity,
-            heatingSetpoint: data.changeableValues.heatSetpoint,
-            coolingSetpoint: data.changeableValues.coolSetpoint,
-            thermostatMode: data.changeableValues.mode.toLowerCase(),
-            thermostatFanMode: data.settings?.fan?.changeableValues?.mode?.toLowerCase() ?: "auto",
-            thermostatOperatingState: parseOperatingState(data.operationStatus.mode),
-            supportedThermostatModes: JsonOutput.toJson(data.allowedModes.collect{ it.toLowerCase() }),
-            supportedThermostatFanModes: JsonOutput.toJson(data.settings?.fan?.allowedModes?.collect{ it.toLowerCase() } ?: ["auto", "on"]),
-            units: data.units == "Fahrenheit" ? "F" : "C"
+            temperature: respData.indoorTemperature,
+            humidity: respData.indoorHumidity,
+            heatingSetpoint: respData.changeableValues?.heatSetpoint,
+            coolingSetpoint: respData.changeableValues?.coolSetpoint,
+            thermostatMode: respData.changeableValues?.mode?.toLowerCase(),
+            thermostatFanMode: respData.settings?.fan?.changeableValues?.mode?.toLowerCase() ?: "auto",
+            thermostatOperatingState: parseOperatingState(respData.operationStatus?.mode),
+            supportedThermostatModes: JsonOutput.toJson(respData.allowedModes?.collect{ it.toLowerCase() } ?: ["off", "heat", "cool", "auto"]),
+            supportedThermostatFanModes: JsonOutput.toJson(respData.settings?.fan?.allowedModes?.collect{ it.toLowerCase() } ?: ["auto", "on"]),
+            units: respData.units == "Fahrenheit" ? "F" : "C"
         ])
 
     }, { errorResp, errorData ->
-        if (errorResp.status == 401 && !retry) {
+        if (errorResp?.status == 401 && !retry) {
             log("Resideo token expired for ${device.label}. Refreshing and retrying.", "warn")
-            refreshResideoToken(device.getDataValue("accountId"))
-            runIn(5, "refreshResideoThermostat", [data: [device: device, retry: true]])
+            def acctId = device.getDataValue("accountId")
+            refreshResideoToken(acctId)
+            // FIXED: Pass DNI string, not device object, through runIn
+            runIn(10, "refreshResideoThermostatByDni", [data: [dni: device.deviceNetworkId, retry: true]])
         } else {
-            log("Failed to refresh Resideo device ${device.label}. Status: ${errorResp.status}", "error")
+            log("Failed to refresh Resideo device ${device.label}. Status: ${errorResp?.status}, Error: ${errorData}", "error")
         }
     })
 }
 
+// Entry point when called via runIn with data map
+void refreshTccThermostatByDni(Map data) {
+    def dev = getChildDevice(data?.dni)
+    if (dev) {
+        refreshTccThermostat(dev, data?.retry ?: false)
+    } else {
+        log("refreshTccThermostatByDni: Could not find device with DNI: ${data?.dni}", "error")
+    }
+}
+
 def refreshTccThermostat(device, retry = false) {
     def dniParts = device.deviceNetworkId.split('\\|')
+    if (dniParts.size() < 3) {
+        log("Invalid DNI format for TCC device: ${device.deviceNetworkId}", "error")
+        return
+    }
     def locationId = dniParts[1]
     def deviceId = dniParts[2]
-    def account = atomicState.accounts[device.getDataValue("accountId")]
-    
+    def accounts = atomicState.accounts
+    def account = accounts ? accounts[device.getDataValue("accountId")] : null
+
+    if (!account) {
+        log("No account found for TCC device ${device.label}. AccountId: ${device.getDataValue('accountId')}", "error")
+        return
+    }
+
     log("Refreshing TCC device: ${device.label}", "debug")
 
-    def params = [
+    def getParams = [
         uri: "${TCC_API_URL}/GetLocations?userId=${account.userId}&allData=True",
         headers: [ Cookie: account.cookie ]
     ]
-    
-    apiGet(params, { resp ->
-        def location = resp.data.locations.find { it.locationID == locationId.toInteger() }
+
+    apiGet(getParams, { resp ->
+        def location = resp.data?.locations?.find { it.locationID == locationId.toInteger() }
         def thermo = location?.thermostats?.find { it.deviceID == deviceId.toInteger() }
         if (thermo) {
             device.parse([
                 temperature: thermo.indoorTemperature,
                 humidity: thermo.indoorHumidity,
-                heatingSetpoint: thermo.changeableValues.heatSetpoint,
-                coolingSetpoint: thermo.changeableValues.coolSetpoint,
-                thermostatMode: parseTccMode(thermo.changeableValues.mode),
-                thermostatFanMode: parseTccFanMode(thermo.fan.changeableValues.mode),
-                thermostatOperatingState: parseOperatingState(thermo.operationStatus.mode),
+                heatingSetpoint: thermo.changeableValues?.heatSetpoint,
+                coolingSetpoint: thermo.changeableValues?.coolSetpoint,
+                thermostatMode: parseTccMode(thermo.changeableValues?.mode),
+                thermostatFanMode: parseTccFanMode(thermo.fan?.changeableValues?.mode),
+                thermostatOperatingState: parseOperatingState(thermo.operationStatus?.mode),
                 supportedThermostatModes: JsonOutput.toJson(["off", "heat", "cool", "auto"]),
                 supportedThermostatFanModes: JsonOutput.toJson(["auto", "on", "circulate"]),
                 units: thermo.units == "Fahrenheit" ? "F" : "C"
@@ -559,9 +729,12 @@ def refreshTccThermostat(device, retry = false) {
         }
     }, { errorResp, errorData ->
         // TCC auth is cookie based, might need re-login
-        log("Failed to refresh TCC device ${device.label}. Status: ${errorResp.status}. Attempting re-login.", "warn")
+        log("Failed to refresh TCC device ${device.label}. Status: ${errorResp?.status}. Attempting re-login.", "warn")
         loginToTcc() // Re-login to get a fresh cookie
-        runIn(10, "refreshTccThermostat", [data: [device: device, retry: true]])
+        if (!retry) {
+            // FIXED: Pass DNI string, not device object, through runIn
+            runIn(15, "refreshTccThermostatByDni", [data: [dni: device.deviceNetworkId, retry: true]])
+        }
     })
 }
 
@@ -580,9 +753,19 @@ void setThermostat(device, Map settings) {
 
 def setResideoThermostat(device, Map settings, retry = false) {
     def dniParts = device.deviceNetworkId.split('\\|')
+    if (dniParts.size() < 3) {
+        log("Invalid DNI format for Resideo device: ${device.deviceNetworkId}", "error")
+        return
+    }
     def locationId = dniParts[1]
     def deviceId = dniParts[2]
-    def account = atomicState.accounts[device.getDataValue("accountId")]
+    def accounts = atomicState.accounts
+    def account = accounts ? accounts[device.getDataValue("accountId")] : null
+
+    if (!account || !account.access_token) {
+        log("No valid account/token found for setting Resideo device ${device.label}.", "error")
+        return
+    }
 
     log("Setting Resideo device ${device.label} with: ${settings}", "debug")
 
@@ -592,31 +775,43 @@ def setResideoThermostat(device, Map settings, retry = false) {
     if (settings.heatSetpoint) body.heatSetpoint = settings.heatSetpoint
     if (settings.coolSetpoint) body.coolSetpoint = settings.coolSetpoint
 
-    def params = [
+    def postParams = [
         uri: "${RESIDEO_API_URL}/v2/devices/thermostats/${deviceId}?apikey=${account.consumerKey}&locationId=${locationId}",
         headers: [ Authorization: "Bearer ${account.access_token}", 'Content-Type': 'application/json' ],
         body: JsonOutput.toJson(body)
     ]
-    
-    apiPost(params, { resp ->
+
+    apiPost(postParams, { resp ->
         log("Successfully set Resideo device ${device.label}.", "info")
-        runIn(2, "refreshDevice", [data: [device: device]]) // Refresh after a short delay
+        // FIXED: Pass DNI string, not device object
+        runIn(2, "refreshDeviceByDni", [data: [dni: device.deviceNetworkId]])
     }, { errorResp, errorData ->
-        if (errorResp.status == 401 && !retry) {
+        if (errorResp?.status == 401 && !retry) {
             log("Resideo token expired on set command. Refreshing and retrying.", "warn")
             refreshResideoToken(device.getDataValue("accountId"))
-            runIn(5, "setResideoThermostat", [data: [device: device, settings: settings, retry: true]])
+            // Cannot pass device or settings through runIn safely; just refresh token and log
+            log("Token refreshed. Please retry the command.", "warn")
         } else {
-            log("Failed to set Resideo device ${device.label}. Status: ${errorResp.status}, Body: ${errorData}", "error")
+            log("Failed to set Resideo device ${device.label}. Status: ${errorResp?.status}, Body: ${errorData}", "error")
         }
     })
 }
 
 def setTccThermostat(device, Map settings, retry = false) {
     def dniParts = device.deviceNetworkId.split('\\|')
+    if (dniParts.size() < 3) {
+        log("Invalid DNI format for TCC device: ${device.deviceNetworkId}", "error")
+        return
+    }
     def deviceId = dniParts[2]
-    def account = atomicState.accounts[device.getDataValue("accountId")]
-    
+    def accounts = atomicState.accounts
+    def account = accounts ? accounts[device.getDataValue("accountId")] : null
+
+    if (!account || !account.cookie) {
+        log("No valid account/cookie found for TCC device ${device.label}.", "error")
+        return
+    }
+
     log("Setting TCC device ${device.label} with: ${settings}", "debug")
 
     def body = [ DeviceId: deviceId.toInteger() ]
@@ -629,20 +824,21 @@ def setTccThermostat(device, Map settings, retry = false) {
         body.StatusCool = 1
     }
 
-    def params = [
+    def postParams = [
         uri: "${TCC_API_URL}/Device/SubmitControlScreenChanges",
         headers: [ Cookie: account.cookie, 'Content-Type': 'application/json' ],
         body: JsonOutput.toJson(body)
     ]
 
-    apiPost(params, { resp ->
+    apiPost(postParams, { resp ->
         log("Successfully set TCC device ${device.label}.", "info")
-        runIn(5, "refreshDevice", [data: [device: device]])
+        // FIXED: Pass DNI string, not device object
+        runIn(5, "refreshDeviceByDni", [data: [dni: device.deviceNetworkId]])
     }, { errorResp, errorData ->
-        log("Failed to set TCC device ${device.label}. Status: ${errorResp.status}. Re-logging in and retrying.", "warn")
+        log("Failed to set TCC device ${device.label}. Status: ${errorResp?.status}. Re-logging in.", "warn")
         loginToTcc()
         if (!retry) {
-            runIn(10, "setTccThermostat", [data: [device: device, settings: settings, retry: true]])
+            log("Re-login initiated. Please retry the command.", "warn")
         }
     })
 }
@@ -713,33 +909,38 @@ void updateSmartSetpoint() {
 // --------------------
 // Utility Functions
 // --------------------
-def apiGet(Map params, Closure success, Closure failure = {}) {
+// FIXED: Default failure closure now accepts 2 parameters and logs the error
+def apiGet(Map params, Closure success, Closure failure = { resp, data -> log("apiGet default failure handler: ${data}", "error") }) {
     try {
         httpGet(params) { resp ->
-            if (resp.status == 200) {
+            if (resp.status >= 200 && resp.status < 300) {
                 success(resp)
             } else {
+                log("apiGet non-success status: ${resp.status} for URI: ${params.uri?.take(80)}", "warn")
                 failure(resp, resp.data)
             }
         }
     } catch (e) {
-        log("Exception in apiGet: ${e.message}", "error")
-        failure(null, e.message)
+        log("Exception in apiGet for URI ${params.uri?.take(80)}: ${e.message}", "error")
+        // Create a minimal response-like object for the failure handler
+        failure([status: 0, message: e.message], e.message)
     }
 }
 
-def apiPost(Map params, Closure success, Closure failure = {}) {
+// FIXED: Default failure closure now accepts 2 parameters and logs the error
+def apiPost(Map params, Closure success, Closure failure = { resp, data -> log("apiPost default failure handler: ${data}", "error") }) {
     try {
         httpPost(params) { resp ->
-            if (resp.status == 200) {
+            if (resp.status >= 200 && resp.status < 300) {
                 success(resp)
             } else {
+                log("apiPost non-success status: ${resp.status} for URI: ${params.uri?.take(80)}", "warn")
                 failure(resp, resp.data)
             }
         }
     } catch (e) {
-        log("Exception in apiPost: ${e.message}", "error")
-        failure(null, e.message)
+        log("Exception in apiPost for URI ${params.uri?.take(80)}: ${e.message}", "error")
+        failure([status: 0, message: e.message], e.message)
     }
 }
 
